@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Image Health Review</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f0f5f8; color: #172b3a; font: 16px/1.6 system-ui, sans-serif; }
+    main { max-width: 760px; margin: 50px auto; padding: 30px; background: white; border-radius: 18px; box-shadow: 0 8px 35px #16354a12; }
+    h1 { margin: 0; font-size: 30px; } h2 { font-size: 21px; }
+    .muted { color: #526775; } .notice { background: #fff6df; padding: 14px; border-radius: 8px; }
+    label { display: block; font-weight: 600; margin-top: 24px; }
+    input { display: block; width: 100%; margin: 10px 0 20px; }
+    button { border: 0; border-radius: 8px; background: #12677b; color: white; padding: 12px 22px; font: inherit; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .error { padding: 14px; border-radius: 8px; background: #ffe9e7; color: #8a211a; }
+    .answer { white-space: pre-wrap; overflow-wrap: anywhere; background: #f0f5f8; padding: 20px; border-radius: 8px; }
+    .pet-list { list-style: none; padding: 0; }
+    .pet-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid #dce6eb; }
+    .pet-list a { color: #12677b; }
+    .pet-list form { margin: 0; }
+    .pet-list button { background: #8a211a; padding: 6px 12px; }
+    @media (max-width: 600px) { main { margin: 15px; padding: 20px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Image Health Review</h1>
+  <p>Signed in as <strong>{{ g.user.username }}</strong></p>
+  <form method="post" action="{{ url_for('logout') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Log out</button>
+  </form>
+  <p class="muted">Upload a human or animal photo to get an AI response.</p>
+  <p class="notice">Educational demo, not a diagnosis. An image cannot establish that someone is healthy, and AI confidence percentages are not validated medical probabilities. Consult a qualified clinician or veterinarian for health concerns.</p>
+  <section aria-label="Pet profiles">
+    <h2>Your pets</h2>
+    <form method="post" action="{{ url_for('add_pet') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label for="pet-name">Add a pet</label>
+      <input id="pet-name" name="name" maxlength="60" required placeholder="Pet name">
+      <button type="submit">Add pet</button>
+    </form>
+    {% if pets %}
+      <ul class="pet-list">
+      {% for pet in pets %}
+        <li>
+          <span><a href="{{ url_for('index', pet_id=pet.id) }}">{{ pet.name }}</a>{% if selected_pet and pet.id == selected_pet.id %} <strong>(selected)</strong>{% endif %}</span>
+          <form method="post" action="{{ url_for('delete_pet', pet_id=pet.id) }}" onsubmit="return confirm('Remove this pet and permanently delete all its saved responses?')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" aria-label="Remove {{ pet.name }}">Remove</button>
+          </form>
+        </li>
+      {% endfor %}
+      </ul>
+    {% else %}<p class="muted">Add your first pet to submit an image.</p>{% endif %}
+  </section>
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  {% if selected_pet %}
+  <h2>Analyze an image for {{ selected_pet.name }}</h2>
+  <form method="post" enctype="multipart/form-data" id="upload-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="pet_id" value="{{ selected_pet.id }}">
+    <label for="image">Choose an image</label>
+    <input type="file" name="image" id="image" accept="image/jpeg,image/png,image/webp,image/gif" required>
+    <p class="muted">JPEG, PNG, WebP, or non-animated GIF. Maximum 10 MB and 20 million pixels. Submitting sends the image to OpenAI. Responses are saved under {{ selected_pet.name }}; uploaded images are not saved.</p>
+    <button type="submit" id="submit">Analyze image</button>
+    <p id="status" role="status" aria-live="polite"></p>
+  </form>
+  <section aria-label="Recent responses">
+    <h2>{{ selected_pet.name }}’s 3 most recent responses</h2>
+    {% for item in history %}
+      <article>
+        <p class="muted">{{ item.created_at }} UTC{% if loop.first %} · Most recent{% endif %}</p>
+        <div class="answer">{{ item.answer }}</div>
+      </article>
+    {% else %}
+      <p class="muted">No responses yet. Submit an image above to start your history.</p>
+    {% endfor %}
+  </section>
+  {% endif %}
+</main>
+<script>
+  const uploadForm = document.getElementById('upload-form');
+  if (uploadForm) uploadForm.addEventListener('submit', function(event) {
+    const file = document.getElementById('image').files[0];
+    if (file && file.size > 10 * 1024 * 1024) {
+      event.preventDefault();
+      document.getElementById('status').textContent = 'Choose an image smaller than 10 MB.';
+      return;
+    }
+    document.getElementById('submit').disabled = true;
+    document.getElementById('status').textContent = 'Analyzing your image. This may take up to 90 seconds...';
+  });
+</script>
+</body>
+</html>
