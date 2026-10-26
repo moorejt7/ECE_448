@@ -1,0 +1,43 @@
+services:
+  - type: web
+    name: ece-pet-health
+    runtime: python
+    repo: https://github.com/moorejt7/ECE_448
+    branch: main
+    plan: 0.5c-512mb
+    region: virginia
+    numInstances: 1
+    buildCommand: pip install --require-hashes -r requirements.txt
+    startCommand: gunicorn --config gunicorn.conf.py app:app
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass
+    disk:
+      name: pet-history
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: PORT
+        value: '10000'
+      - key: PERSISTENT_DATA_ROOT
+        value: /var/data
+      - key: APP_DATA_DIR
+        value: /var/data/app
+      # Override Render's default Gunicorn arguments (which enable access logs).
+      - key: GUNICORN_CMD_ARGS
+        value: --config gunicorn.conf.py
+      - key: SECRET_KEY
+        generateValue: true
+      - key: REGISTRATION_CODE
+        generateValue: true
+      - key: DATA_ENCRYPTION_KEY
+        generateValue: true
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
+      - key: IMAGE_DAILY_LIMIT
+        value: '30'
+      - key: IMAGE_GLOBAL_DAILY_LIMIT
+        value: '100'

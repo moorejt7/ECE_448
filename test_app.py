@@ -327,6 +327,30 @@ class AppTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             backup_database(source, destination)
 
+    def test_render_config_generated_secrets_and_existing_disk(self):
+        import base64
+        from flask import Flask
+        from settings import configure_app
+        generated_secret = base64.b64encode(os.urandom(32)).decode()
+        render_env = {'APP_ENV': 'development', 'RENDER': 'true',
+                      'RENDER_EXTERNAL_HOSTNAME': 'pets.onrender.com',
+                      'RAILWAY_VOLUME_MOUNT_PATH': '', 'RAILWAY_ENVIRONMENT_ID': '',
+                      'PERSISTENT_DATA_ROOT': self.directory.name, 'APP_DATA_DIR': self.directory.name,
+                      'SECRET_KEY': generated_secret, 'REGISTRATION_CODE': generated_secret,
+                      'DATA_ENCRYPTION_KEY': base64.b64encode(os.urandom(32)).decode()}
+        with patch.dict(os.environ, render_env):
+            configured = Flask('render-config')
+            configure_app(configured)
+            self.assertTrue(configured.config['PRODUCTION'])
+            self.assertTrue(configured.config['SESSION_COOKIE_SECURE'])
+            self.assertIn('pets.onrender.com', configured.config['TRUSTED_HOSTS'])
+            self.assertNotIn('healthcheck.railway.app', configured.config['TRUSTED_HOSTS'])
+            missing = str(Path(self.directory.name) / 'not-mounted')
+            with patch.dict(os.environ, {'PERSISTENT_DATA_ROOT': missing, 'APP_DATA_DIR': missing}):
+                with self.assertRaises(RuntimeError):
+                    configure_app(Flask('render-missing-disk'))
+                self.assertFalse(Path(missing).exists())
+
 
 if __name__ == '__main__':
     unittest.main()

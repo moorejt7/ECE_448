@@ -9,18 +9,21 @@ from cryptography.fernet import Fernet
 
 
 def configure_app(app):
-    production = os.getenv('APP_ENV') == 'production' or bool(os.getenv('RAILWAY_ENVIRONMENT_ID'))
-    volume = os.getenv('RAILWAY_VOLUME_MOUNT_PATH', '')
+    on_render = os.getenv('RENDER') == 'true'
+    on_railway = bool(os.getenv('RAILWAY_ENVIRONMENT_ID'))
+    production = os.getenv('APP_ENV') == 'production' or on_render or on_railway
+    volume = os.getenv('RAILWAY_VOLUME_MOUNT_PATH') or os.getenv('PERSISTENT_DATA_ROOT', '')
     data_dir = Path(os.getenv('APP_DATA_DIR') or volume or Path(__file__).with_name('instance'))
     secret = os.getenv('SECRET_KEY', '')
     registration_code = os.getenv('REGISTRATION_CODE', '')
     encryption_key = os.getenv('DATA_ENCRYPTION_KEY', '')
     cipher = Fernet(encryption_key.encode()) if encryption_key else None
     if production:
-        if not volume or not data_dir.resolve().is_relative_to(Path(volume).resolve()):
-            raise RuntimeError('Production requires a Railway volume for APP_DATA_DIR.')
-        if len(secret) < 64 or len(set(secret)) < 16:
-            raise RuntimeError('Set SECRET_KEY to a cryptographically random value of at least 64 characters.')
+        if not volume or not Path(volume).is_dir() or not data_dir.resolve().is_relative_to(Path(volume).resolve()):
+            raise RuntimeError('Production requires an existing persistent disk for APP_DATA_DIR.')
+        # Render generates base64-encoded 256-bit secrets (44 characters).
+        if len(secret) < 43 or len(set(secret)) < 16:
+            raise RuntimeError('Set SECRET_KEY to a cryptographically random value with at least 256 bits of entropy.')
         if len(registration_code) < 24:
             raise RuntimeError('Set REGISTRATION_CODE to a random invitation code of at least 24 characters.')
         if cipher is None:
@@ -38,12 +41,15 @@ def configure_app(app):
             pass
         secret = secret_path.read_text().strip()
     hosts = [host.strip() for host in os.getenv('ALLOWED_HOSTS', '').split(',') if host.strip()]
-    public_domain = os.getenv('RAILWAY_PUBLIC_DOMAIN', '')
+    public_domain = os.getenv('RENDER_EXTERNAL_HOSTNAME') if on_render else os.getenv('RAILWAY_PUBLIC_DOMAIN', '')
     if public_domain:
         hosts.append(public_domain)
     if production:
-        hosts.append('healthcheck.railway.app')
-        # Only deploy behind Railway's single trusted ingress proxy.
+        if on_railway or os.getenv('RAILWAY_VOLUME_MOUNT_PATH'):
+            hosts.append('healthcheck.railway.app')
+        if not hosts:
+            raise RuntimeError('Production requires the hosting domain or explicit ALLOWED_HOSTS.')
+        # Only deploy behind the hosting provider's single trusted ingress proxy.
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
     app.config.update(
         PRODUCTION=production,

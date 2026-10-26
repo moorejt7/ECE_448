@@ -15,16 +15,28 @@ from pathlib import Path
 @unittest.skipIf(os.name == 'nt', 'Gunicorn runs on Linux; verified by GitHub CI.')
 class HostingTests(unittest.TestCase):
     def test_gunicorn_health_secure_cookie_and_https_redirect(self):
+        self.exercise_hosting('railway')
+
+    def test_render_gunicorn_health_secure_cookie_and_https_redirect(self):
+        self.exercise_hosting('render')
+
+    def exercise_hosting(self, provider):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
             with socket.socket() as listener:
                 listener.bind(('127.0.0.1', 0))
                 port = listener.getsockname()[1]
-            env = os.environ | {
-                'APP_ENV': 'production', 'RAILWAY_VOLUME_MOUNT_PATH': directory,
+            env = {key: value for key, value in os.environ.items() if not key.startswith(('RENDER', 'RAILWAY'))}
+            hostname = 'example.onrender.com' if provider == 'render' else 'example.up.railway.app'
+            env.update({
+                'APP_ENV': 'production',
                 'APP_DATA_DIR': directory, 'SECRET_KEY': secrets.token_urlsafe(64),
                 'REGISTRATION_CODE': secrets.token_urlsafe(32), 'PORT': str(port),
-                'RAILWAY_PUBLIC_DOMAIN': 'example.up.railway.app',
-            }
+            })
+            if provider == 'render':
+                env.update({'APP_ENV': 'development', 'RENDER': 'true', 'RENDER_EXTERNAL_HOSTNAME': hostname,
+                            'PERSISTENT_DATA_ROOT': directory, 'GUNICORN_CMD_ARGS': '--config gunicorn.conf.py'})
+            else:
+                env.update({'RAILWAY_VOLUME_MOUNT_PATH': directory, 'RAILWAY_PUBLIC_DOMAIN': hostname})
             from cryptography.fernet import Fernet
             env['DATA_ENCRYPTION_KEY'] = Fernet.generate_key().decode()
             process = subprocess.Popen(['gunicorn', '--config', 'gunicorn.conf.py', 'app:app'],
@@ -34,7 +46,7 @@ class HostingTests(unittest.TestCase):
                 for _ in range(100):
                     try:
                         request = urllib.request.Request(f'http://127.0.0.1:{port}/health',
-                                                          headers={'Host': 'healthcheck.railway.app'})
+                                                          headers={'Host': hostname})
                         with urllib.request.urlopen(request, timeout=1) as response:
                             self.assertEqual(json.load(response), {'status': 'ok'})
                         break
@@ -45,7 +57,7 @@ class HostingTests(unittest.TestCase):
                 else:
                     self.fail('Production healthcheck did not become ready.')
                 request = urllib.request.Request(f'http://127.0.0.1:{port}/login',
-                    headers={'Host': 'example.up.railway.app', 'X-Forwarded-Proto': 'https'})
+                    headers={'Host': hostname, 'X-Forwarded-Proto': 'https'})
                 with urllib.request.urlopen(request, timeout=5) as response:
                     cookie = response.headers['Set-Cookie']
                     self.assertIn('__Host-session=', cookie)
@@ -59,11 +71,11 @@ class HostingTests(unittest.TestCase):
                         return None
                 opener = urllib.request.build_opener(NoRedirect)
                 request = urllib.request.Request(f'http://127.0.0.1:{port}/login',
-                                                 headers={'Host': 'example.up.railway.app'})
+                                                 headers={'Host': hostname})
                 with self.assertRaises(urllib.error.HTTPError) as captured:
                     opener.open(request, timeout=5)
                 self.assertEqual(captured.exception.code, 308)
-                self.assertEqual(captured.exception.headers['Location'], 'https://example.up.railway.app/login')
+                self.assertEqual(captured.exception.headers['Location'], f'https://{hostname}/login')
             finally:
                 process.terminate()
                 process.communicate(timeout=10)
