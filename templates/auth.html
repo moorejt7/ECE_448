@@ -4,16 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ 'Create account' if registering else 'Log in' }} · Image Health Review</title>
-  <style>
-    * { box-sizing: border-box; }
-    body { margin: 0; background: #f0f5f8; color: #172b3a; font: 16px/1.6 system-ui, sans-serif; }
-    main { max-width: 480px; margin: 50px auto; padding: 30px; background: white; border-radius: 18px; box-shadow: 0 8px 35px #16354a12; }
-    h1 { margin-top: 0; font-size: 27px; } label { display: block; margin-top: 18px; font-weight: 600; }
-    input { width: 100%; padding: 10px; font: inherit; border: 1px solid #a5b8c5; border-radius: 6px; }
-    button { margin-top: 24px; border: 0; border-radius: 8px; background: #12677b; color: white; padding: 12px 22px; font: inherit; cursor: pointer; }
-    a { color: #12677b; } .error { padding: 12px; background: #ffe9e7; color: #8a211a; border-radius: 8px; }
-    @media (max-width: 520px) { main { margin: 15px; padding: 20px; } }
-  </style>
+  <link rel="stylesheet" href="{{ url_for('static', filename='auth.css') }}">
 </head>
 <body><main>
   <h1>{{ 'Create account' if registering else 'Log in' }}</h1>
@@ -25,11 +16,16 @@
     <input id="username" name="username" autocomplete="username" required maxlength="32" value="{{ request.form.get('username', '') }}" {% if registering %}minlength="3" pattern="[A-Za-z0-9_]{3,32}" aria-describedby="username-help"{% endif %}>
     {% if registering %}<small id="username-help">3–32 letters, numbers, or underscores.</small>{% endif %}
     <label for="password">Password</label>
-    <input id="password" name="password" type="password" required maxlength="128" autocomplete="{{ 'new-password' if registering else 'current-password' }}" {% if registering %}minlength="8"{% endif %}>
+    <input id="password" name="password" type="password" required maxlength="128" autocomplete="{{ 'new-password' if registering else 'current-password' }}" {% if registering %}minlength="12"{% endif %}>
     {% if registering %}
-      <small>At least 8 characters.</small>
+      {% if invitation_required %}
+        <label for="registration_code">Access code</label>
+        <input id="registration_code" name="registration_code" type="password" autocomplete="off" required maxlength="128">
+        <small>Ask the app owner for an access code.</small>
+      {% endif %}
+      <small>At least 12 characters.</small>
       <label for="confirm_password">Confirm password</label>
-      <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required minlength="8" maxlength="128">
+      <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required minlength="12" maxlength="128">
     {% endif %}
     <button type="submit">{{ 'Create account' if registering else 'Log in' }}</button>
   </form>

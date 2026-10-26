@@ -1,0 +1,19 @@
+name: Tests and dependency audit
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install --require-hashes -r requirements.txt
+      - run: python -m unittest -v test_app.py test_hosting.py
+      - run: pip install pip-audit==2.10.1
+      - run: pip-audit --require-hashes -r requirements.txt

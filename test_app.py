@@ -15,7 +15,7 @@ class AppTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).parent)
         self.addCleanup(self.directory.cleanup)
-        server.app.config.update(TESTING=True, DATABASE=str(Path(self.directory.name) / 'test.sqlite3'))
+        server.app.config.update(TESTING=True, RATE_LIMIT_ENABLED=False, DATABASE=str(Path(self.directory.name) / 'test.sqlite3'))
         self.client = server.app.test_client()
         self.register('alice')
         self.pet_id = self.add_pet('Fido')
@@ -28,8 +28,8 @@ class AppTests(unittest.TestCase):
     def register(self, username, client=None):
         client = client or self.client
         client.get('/register')
-        return client.post('/register', data={'username': username, 'password': 'password123',
-            'confirm_password': 'password123', 'csrf_token': self.token(client)}, follow_redirects=True)
+        return client.post('/register', data={'username': username, 'password': 'password12345',
+            'confirm_password': 'password12345', 'csrf_token': self.token(client)}, follow_redirects=True)
 
     def logout(self):
         return self.client.post('/logout', data={'csrf_token': self.token()}, follow_redirects=True)
@@ -100,12 +100,12 @@ class AppTests(unittest.TestCase):
     def test_password_hash_and_login(self):
         with server.app.app_context():
             row = server.get_db().execute('SELECT * FROM users').fetchone()
-            self.assertNotEqual(row['password_hash'], 'password123')
-            self.assertTrue(server.check_password_hash(row['password_hash'], 'password123'))
+            self.assertNotEqual(row['password_hash'], 'password12345')
+            self.assertTrue(server.check_password_hash(row['password_hash'], 'password12345'))
         self.logout()
         bad = self.client.post('/login', data={'username': 'alice', 'password': 'wrong', 'csrf_token': self.token()})
         self.assertEqual(bad.status_code, 401)
-        good = self.client.post('/login', data={'username': 'ALICE', 'password': 'password123', 'csrf_token': self.token()}, follow_redirects=True)
+        good = self.client.post('/login', data={'username': 'ALICE', 'password': 'password12345', 'csrf_token': self.token()}, follow_redirects=True)
         self.assertIn(b'Signed in as', good.data)
 
     def test_duplicate_and_invalid_registration(self):
@@ -128,7 +128,7 @@ class AppTests(unittest.TestCase):
             create.return_value = SimpleNamespace(output_text=f'Result-{number}', status='completed')
             self.assertEqual(self.upload().status_code, 200)
         self.logout()
-        self.client.post('/login', data={'username': 'alice', 'password': 'password123', 'csrf_token': self.token()})
+        self.client.post('/login', data={'username': 'alice', 'password': 'password12345', 'csrf_token': self.token()})
         page = self.client.get('/').data
         self.assertNotIn(b'Result-0', page)
         self.assertLess(page.index(b'Result-3'), page.index(b'Result-2'))
@@ -228,6 +228,104 @@ class AppTests(unittest.TestCase):
             self.assertEqual(context[0]['result'], {'disease': 'old'})
             values = [row[0] for row in db.execute('SELECT json_data FROM responses ORDER BY id')]
             self.assertEqual(values, ['{"disease":"old"}', ''])
+
+    def test_logout_revokes_copied_session(self):
+        cookie = self.client.get_cookie('session')
+        copied = server.app.test_client()
+        copied.set_cookie('session', cookie.value)
+        self.assertEqual(copied.get('/').status_code, 200)
+        self.logout()
+        self.assertEqual(copied.get('/').location, '/login')
+
+    def test_login_rate_limit(self):
+        with patch.dict(server.app.config, {'RATE_LIMIT_ENABLED': True}):
+            self.logout()
+            for _ in range(20):
+                response = self.client.post('/login', data={
+                    'username': 'nonexistent', 'password': 'invalid', 'csrf_token': self.token()})
+                self.assertEqual(response.status_code, 401)
+            response = self.client.post('/login', data={
+                'username': 'alice', 'password': 'password12345', 'csrf_token': self.token()})
+            self.assertEqual(response.status_code, 429)
+
+    def test_invitation_required_and_long_password(self):
+        with patch.dict(server.app.config, {'REGISTRATION_CODE': 'test-invitation'}):
+            response = self.register('noinvitation')
+            self.assertEqual(response.status_code, 400)
+            self.assertIn(b'valid access code', response.data)
+            response = self.client.post('/register', data={
+                'username': 'invited', 'password': 'password12345', 'confirm_password': 'password12345',
+                'registration_code': 'test-invitation', 'csrf_token': self.token()}, follow_redirects=True)
+            self.assertEqual(response.status_code, 200)
+
+    def test_health_and_security_headers(self):
+        response = self.client.get('/health')
+        self.assertEqual(response.json, {'status': 'ok'})
+        self.assertIn("frame-ancestors 'none'", response.headers['Content-Security-Policy'])
+        self.assertNotIn('unsafe-inline', response.headers['Content-Security-Policy'])
+        self.assertEqual(response.headers['X-Frame-Options'], 'DENY')
+        self.assertEqual(self.client.get('/', headers={'Host': 'untrusted.example'}).status_code, 400)
+
+    @patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'})
+    @patch('app.OpenAI')
+    def test_image_quota_stops_api_call(self, mock_openai):
+        create = mock_openai.return_value.__enter__.return_value.responses.create
+        create.return_value = SimpleNamespace(output_text='{}', status='completed')
+        with patch.dict(server.app.config, {'RATE_LIMIT_ENABLED': True, 'IMAGE_DAILY_LIMIT': 1}):
+            self.assertEqual(self.upload().status_code, 200)
+            self.assertEqual(self.upload().status_code, 429)
+        self.assertEqual(create.call_count, 1)
+
+    def test_production_config_requires_volume_and_secrets(self):
+        from flask import Flask
+        from settings import configure_app
+        from cryptography.fernet import Fernet
+        with patch.dict(os.environ, {'APP_ENV': 'production', 'RAILWAY_VOLUME_MOUNT_PATH': ''}):
+            with self.assertRaises(RuntimeError):
+                configure_app(Flask('test-config'))
+        settings_env = {'APP_ENV': 'production', 'RAILWAY_VOLUME_MOUNT_PATH': self.directory.name,
+                        'APP_DATA_DIR': self.directory.name, 'SECRET_KEY': '0123456789abcdef' * 4,
+                        'REGISTRATION_CODE': 'test-code-that-is-long-enough',
+                        'DATA_ENCRYPTION_KEY': Fernet.generate_key().decode(),
+                        'RAILWAY_PUBLIC_DOMAIN': 'example.up.railway.app'}
+        with patch.dict(os.environ, settings_env):
+            configured = Flask('test-config')
+            configure_app(configured)
+            self.assertTrue(configured.config['SESSION_COOKIE_SECURE'])
+            self.assertEqual(configured.config['SESSION_COOKIE_NAME'], '__Host-session')
+            self.assertIn('example.up.railway.app', configured.config['TRUSTED_HOSTS'])
+
+    @patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'})
+    @patch('app.OpenAI')
+    def test_encrypted_history_and_context(self, mock_openai):
+        from cryptography.fernet import Fernet
+        cipher = Fernet(Fernet.generate_key())
+        create = mock_openai.return_value.__enter__.return_value.responses.create
+        create.return_value = SimpleNamespace(output_text='Private result {"disease":"private"}', status='completed')
+        with patch.dict(server.app.config, {'DATA_CIPHER': cipher}):
+            page = self.upload()
+            self.assertIn(b'Private result', page.data)
+            with server.app.app_context():
+                row = server.get_db().execute('SELECT * FROM responses ORDER BY id DESC LIMIT 1').fetchone()
+                self.assertEqual(row['encrypted'], 1)
+                self.assertNotIn('Private result', row['answer'])
+                self.assertNotIn('private', row['json_data'])
+            self.upload()
+            prior = json.loads(create.call_args.kwargs['input'][0]['content'][1]['text'])
+            self.assertEqual(prior['previous_results'][0]['result'], {'disease': 'private'})
+
+    def test_backup_is_consistent_and_does_not_overwrite(self):
+        from backup_db import backup_database
+        import sqlite3
+        source = Path(server.app.config['DATABASE'])
+        destination = Path(self.directory.name) / 'backup.sqlite3'
+        backup_database(source, destination)
+        with sqlite3.connect(destination) as restored:
+            self.assertEqual(restored.execute('SELECT count(*) FROM users').fetchone()[0], 1)
+            self.assertEqual(restored.execute('SELECT count(*) FROM pets').fetchone()[0], 1)
+        restored.close()
+        with self.assertRaises(FileExistsError):
+            backup_database(source, destination)
 
 
 if __name__ == '__main__':

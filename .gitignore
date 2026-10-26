@@ -2,3 +2,7 @@
 .venv/
 __pycache__/
 instance/
+.railway/
+*.sqlite3
+*.sqlite3-*
+*.key

@@ -1,0 +1,17 @@
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f0f5f8; color: #172b3a; font: 16px/1.6 system-ui, sans-serif; }
+    main { max-width: 760px; margin: 50px auto; padding: 30px; background: white; border-radius: 18px; box-shadow: 0 8px 35px #16354a12; }
+    h1 { margin: 0; font-size: 30px; } h2 { font-size: 21px; }
+    .muted { color: #526775; } .notice { background: #fff6df; padding: 14px; border-radius: 8px; }
+    label { display: block; font-weight: 600; margin-top: 24px; }
+    input { display: block; width: 100%; margin: 10px 0 20px; }
+    button { border: 0; border-radius: 8px; background: #12677b; color: white; padding: 12px 22px; font: inherit; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .error { padding: 14px; border-radius: 8px; background: #ffe9e7; color: #8a211a; }
+    .answer { white-space: pre-wrap; overflow-wrap: anywhere; background: #f0f5f8; padding: 20px; border-radius: 8px; }
+    .pet-list { list-style: none; padding: 0; }
+    .pet-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid #dce6eb; }
+    .pet-list a { color: #12677b; }
+    .pet-list form { margin: 0; }
+    .pet-list button { background: #8a211a; padding: 6px 12px; }
+    @media (max-width: 600px) { main { margin: 15px; padding: 20px; } }
