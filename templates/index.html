@@ -40,6 +40,39 @@
   </section>
   {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
   {% if selected_pet %}
+  <section aria-label="Remote uploads">
+    <h2>Raspberry Pi access for {{ selected_pet.name }}</h2>
+    <p class="muted">Pet ID: <strong>{{ selected_pet.id }}</strong>. Device credentials can upload only to this pet and use your account's analysis quota.</p>
+    {% if new_device_token %}
+      <p class="notice">Copy this credential into a private file on your Pi. It is shown only once. Keep it secret and revoke it below if exposed.</p>
+      <pre class="answer">{{ new_device_token }}</pre>
+    {% endif %}
+    <details>
+      <summary>Create a device credential</summary>
+      <form method="post" action="{{ url_for('create_device_token', pet_id=selected_pet.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="device-name">Device name</label>
+        <input id="device-name" name="name" maxlength="60" placeholder="Raspberry Pi" required>
+        <label for="device-days">Expires after</label>
+        <select id="device-days" name="days">
+          <option value="1">1 day</option><option value="7">7 days</option>
+          <option value="30" selected>30 days</option><option value="90">90 days</option>
+        </select>
+        <label for="device-password">Confirm your account password</label>
+        <input id="device-password" name="password" type="password" autocomplete="current-password" maxlength="128" required>
+        <button type="submit">Create credential</button>
+      </form>
+    </details>
+    {% for device in devices %}
+      <article>
+        <p>{{ device.name }} · Expires {{ device.expires_at }} UTC · Last used {{ device.last_used_at or 'never' }}</p>
+        <form method="post" action="{{ url_for('revoke_device_token', token_id=device.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit">Revoke credential</button>
+        </form>
+      </article>
+    {% endfor %}
+  </section>
   <h2>Analyze an image for {{ selected_pet.name }}</h2>
   <form method="post" enctype="multipart/form-data" id="upload-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

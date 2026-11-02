@@ -2,6 +2,8 @@
 
 A local Python/Flask HTML server that sends one uploaded image and your exact requested prompt to the OpenAI Responses API, then displays the returned text on the page.
 
+Raspberry Pi uploads are supported through a pet-scoped HTTPS API. See [raspberry_pi/README.md](raspberry_pi/README.md) for the ready-to-run Python client, camera capture, credential setup, and API contract. The website can issue and revoke device credentials under each pet. Browser and device uploads share image validation, model context, storage, and quotas.
+
 For HTTPS hosting, persistent storage, deployment variables, and security maintenance, see [RENDER.md](RENDER.md). The `render.yaml` Blueprint configures the paid service and persistent disk. Production signup requires an invitation code to protect paid API usage. [Railway instructions](RAILWAY.md) remain available as an alternative.
 
 ## Run on Windows (Python 3.10+)

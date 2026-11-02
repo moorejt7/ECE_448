@@ -15,7 +15,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, Request, render_template, request, session, redirect, url_for, g, abort
+from flask.sessions import SecureCookieSessionInterface
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.exceptions import HTTPException
 from openai import OpenAI, APIConnectionError, APIStatusError, AuthenticationError, RateLimitError
 from PIL import Image, ImageOps, UnidentifiedImageError
 from settings import configure_app
@@ -29,8 +31,20 @@ class MemoryUploadRequest(Request):
         return io.BytesIO()
 
 
+class DeviceAwareSessionInterface(SecureCookieSessionInterface):
+    def open_session(self, app, current_request):
+        if current_request.path.startswith('/api/'):
+            return self.session_class()
+        return super().open_session(app, current_request)
+
+    def save_session(self, app, current_session, response):
+        if not request.path.startswith('/api/'):
+            super().save_session(app, current_session, response)
+
+
 app = Flask(__name__)
 app.request_class = MemoryUploadRequest
+app.session_interface = DeviceAwareSessionInterface()
 data_dir = configure_app(app)
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
 IMAGE_PROCESSING_LOCK = threading.BoundedSemaphore(1)
@@ -120,6 +134,17 @@ def get_db():
                 name TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS device_tokens (
+                id INTEGER PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                pet_id INTEGER NOT NULL REFERENCES pets(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%S', 'now')),
+                expires_at INTEGER NOT NULL,
+                last_used_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS device_tokens_user_pet ON device_tokens(user_id, pet_id);
         ''')
         key_check = g.db.execute("SELECT value FROM app_metadata WHERE name = 'data_key_check'").fetchone()
         if key_check:
@@ -179,14 +204,41 @@ def authenticate_and_check_csrf():
     if request.endpoint == 'health':
         return None
     if app.config['PRODUCTION'] and not request.is_secure:
+        if request.path.startswith('/api/'):
+            return api_text('HTTPS is required. Use the canonical HTTPS URL.', 400)
         return redirect(request.url.replace('http://', 'https://', 1), code=308)
+    if request.path.startswith('/api/'):
+        # Device endpoints never accept browser cookies as authentication.
+        if request.headers.get('Origin'):
+            return api_text('Browser-origin requests are not accepted by the device API.', 403)
+        if request.endpoint in {'api_images', 'api_pets', 'api_logout'}:
+            parts = request.headers.get('Authorization', '').split()
+            if len(parts) != 2 or parts[0].lower() != 'bearer' or not re.fullmatch(r'pet_[A-Za-z0-9_-]{43}', parts[1]):
+                return api_text('A valid Bearer token is required.', 401)
+            db = get_db()
+            token = db.execute(
+                'SELECT device_tokens.id, device_tokens.user_id, device_tokens.pet_id, pets.name AS pet_name, users.username '
+                'FROM device_tokens JOIN users ON users.id = device_tokens.user_id '
+                'JOIN pets ON pets.id = device_tokens.pet_id AND pets.user_id = users.id '
+                'WHERE token_hash = ? AND expires_at > ?',
+                (hashlib.sha256(parts[1].encode()).hexdigest(), int(time.time())),
+            ).fetchone()
+            if token is None:
+                return api_text('Token is invalid, expired, or revoked.', 401)
+            g.user = {'id': token['user_id'], 'username': token['username']}
+            g.api_pet = {'id': token['pet_id'], 'name': token['pet_name']}
+            g.device_token_id = token['id']
+            with db:
+                db.execute("UPDATE device_tokens SET last_used_at = strftime('%Y-%m-%d %H:%M:%S', 'now') WHERE id = ?",
+                           (token['id'],))
+        return None
     if session.get('auth_token'):
         g.user = get_db().execute(
             'SELECT users.id, users.username FROM users JOIN auth_sessions '
             'ON users.id = auth_sessions.user_id WHERE token_hash = ? AND expires_at > ?',
             (hashlib.sha256(session['auth_token'].encode()).hexdigest(), int(time.time())),
         ).fetchone()
-    if request.endpoint in {'index', 'logout', 'add_pet', 'delete_pet'} and g.user is None:
+    if request.endpoint in {'index', 'logout', 'add_pet', 'delete_pet', 'create_device_token', 'revoke_device_token'} and g.user is None:
         return redirect(url_for('login'))
     if request.method == 'POST':
         token = request.form.get('csrf_token', '')
@@ -210,7 +262,7 @@ def limit_request(category, identity, limit, seconds):
             (key, (bucket + 1) * seconds),
         ).fetchone()
     if row['count'] > limit:
-        abort(429)
+        abort(429, retry_after=(bucket + 1) * seconds - now)
 
 
 def sign_in(user_id):
@@ -238,7 +290,7 @@ def template_context():
 def owned_pet(pet_id):
     try:
         pet_id = int(pet_id)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if not 1 <= pet_id <= 9223372036854775807:
         return None
@@ -246,7 +298,7 @@ def owned_pet(pet_id):
                             (pet_id, g.user['id'])).fetchone()
 
 
-def show_home(error=None, status=200):
+def show_home(error=None, status=200, new_device_token=None):
     pets = get_db().execute('SELECT id, name FROM pets WHERE user_id = ? ORDER BY id',
                             (g.user['id'],)).fetchall()
     requested_id = request.args.get('pet_id') if request.method == 'GET' else None
@@ -264,8 +316,119 @@ def show_home(error=None, status=200):
     else:
         session.pop('pet_id', None)
         history = []
+    devices = get_db().execute(
+        "SELECT id, name, datetime(expires_at, 'unixepoch') AS expires_at, last_used_at FROM device_tokens "
+        'WHERE user_id = ? AND pet_id = ? AND expires_at > ? ORDER BY id DESC',
+        (g.user['id'], selected['id'] if selected else None, int(time.time())),
+    ).fetchall()
     return render_template('index.html', pets=pets, selected_pet=selected,
-                           history=history, error=error), status
+                           history=history, error=error, devices=devices, new_device_token=new_device_token), status
+
+
+def issue_device_token(user_id, pet_id, name, lifetime):
+    token = 'pet_' + secrets.token_urlsafe(32)
+    expires_at = int(time.time()) + lifetime
+    db = get_db()
+    with db:
+        db.execute('DELETE FROM device_tokens WHERE expires_at <= ?', (int(time.time()),))
+        active = db.execute('SELECT count(*) FROM device_tokens WHERE user_id = ?', (user_id,)).fetchone()[0]
+        if active >= 20:
+            abort(409, 'Revoke an existing device credential before creating another.')
+        db.execute('INSERT INTO device_tokens (token_hash, user_id, pet_id, name, expires_at) VALUES (?, ?, ?, ?, ?)',
+                   (hashlib.sha256(token.encode()).hexdigest(), user_id, pet_id, name, expires_at))
+    return token, expires_at
+
+
+@app.post('/pets/<int:pet_id>/tokens')
+def create_device_token(pet_id):
+    pet = owned_pet(pet_id)
+    if pet is None:
+        abort(404)
+    session['pet_id'] = pet_id
+    limit_request('login-ip', request.remote_addr, 20, 900)
+    user = get_db().execute('SELECT password_hash FROM users WHERE id = ?', (g.user['id'],)).fetchone()
+    password = request.form.get('password', '')
+    if len(password) > 128 or not check_password_hash(user['password_hash'], password):
+        return show_home('Incorrect password. A device credential was not created.', 401)
+    name = request.form.get('name', '').strip()
+    days = request.form.get('days', type=int)
+    if not name or len(name) > 60 or any(ord(char) < 32 for char in name) or days not in {1, 7, 30, 90}:
+        return show_home('Enter a device name and choose an allowed expiry.', 400)
+    token, _ = issue_device_token(g.user['id'], pet_id, name, days * 86400)
+    return show_home(new_device_token=token)
+
+
+@app.post('/devices/<int:token_id>/revoke')
+def revoke_device_token(token_id):
+    db = get_db()
+    with db:
+        result = db.execute('DELETE FROM device_tokens WHERE id = ? AND user_id = ?', (token_id, g.user['id']))
+    if not result.rowcount:
+        abort(404)
+    return redirect(url_for('index'))
+
+
+def api_text(message, status=200):
+    response = app.response_class(message, status=status, mimetype='text/plain')
+    if status == 401:
+        response.headers['WWW-Authenticate'] = 'Bearer'
+    return response
+
+
+@app.post('/api/login')
+def api_login():
+    limit_request('login-ip', request.remote_addr, 20, 900)
+    if not request.is_json:
+        return api_text('Send credentials and pet_id or pet_name as application/json.', 415)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_text('A JSON object is required.', 400)
+    username, password = data.get('username'), data.get('password')
+    if not isinstance(username, str) or not isinstance(password, str) or len(username) > 32 or len(password) > 128:
+        return api_text('Incorrect username or password.', 401)
+    user = get_db().execute('SELECT * FROM users WHERE username = ?', (username.strip(),)).fetchone()
+    valid = check_password_hash(user['password_hash'] if user else DUMMY_PASSWORD_HASH, password)
+    if not user or not valid:
+        return api_text('Incorrect username or password.', 401)
+    g.user = {'id': user['id'], 'username': user['username']}
+    if data.get('pet_id') is not None:
+        pet = owned_pet(data['pet_id'])
+    elif isinstance(data.get('pet_name'), str):
+        pet = get_db().execute('SELECT id, name FROM pets WHERE user_id = ? AND name = ?',
+                               (user['id'], data['pet_name'].strip())).fetchone()
+    else:
+        return api_text('Supply pet_id or pet_name for your account.', 400)
+    if pet is None:
+        return api_text('Pet not found in this account.', 404)
+    token, expires_at = issue_device_token(user['id'], pet['id'], 'Temporary API login', 3600)
+    return {'access_token': token, 'token_type': 'Bearer', 'expires_at': expires_at, 'pet_id': pet['id']}
+
+
+@app.get('/api/pets')
+def api_pets():
+    return {'pets': [g.api_pet]}
+
+
+@app.post('/api/logout')
+def api_logout():
+    db = get_db()
+    with db:
+        db.execute('DELETE FROM device_tokens WHERE id = ?', (g.device_token_id,))
+    return api_text('Credential revoked.')
+
+
+@app.post('/api/images')
+def api_images():
+    supplied_pet_id = request.form.get('pet_id')
+    if supplied_pet_id is not None and supplied_pet_id != str(g.api_pet['id']):
+        return api_text('This credential is restricted to a different pet.', 403)
+    try:
+        answer, response_id = analyze_upload(g.user['id'], g.api_pet, request.files.get('image'))
+    except AnalysisError as error:
+        return api_text(str(error), error.status)
+    response = api_text(answer)
+    response.headers['X-Response-ID'] = str(response_id)
+    return response
 
 
 @app.post('/pets')
@@ -397,14 +560,24 @@ def no_cache(response):
 
 @app.errorhandler(429)
 def throttled(error):
-    response = app.make_response(('Too many attempts. Please try again later.', 429))
-    response.headers['Retry-After'] = '900'
+    response = api_text('Too many attempts. Please try again later.', 429)
+    response.headers['Retry-After'] = str(getattr(error, 'retry_after', None) or 900)
     return response
 
 
 @app.errorhandler(500)
 def internal_error(error):
-    return 'The request could not be completed. Please try again later.', 500
+    return api_text('The request could not be completed. Please try again later.', 500)
+
+
+@app.errorhandler(HTTPException)
+def http_error(error):
+    if request.path.startswith('/api/'):
+        message = {400: 'Invalid request.', 403: 'Access denied.', 404: 'Resource not found.',
+                   405: 'Method not allowed.', 409: 'Revoke an existing device credential before creating another.',
+                   415: 'Unsupported content type.'}.get(error.code, 'Request could not be completed.')
+        return api_text(message, error.code)
+    return error
 
 
 @app.get('/health')
@@ -415,6 +588,8 @@ def health():
 
 @app.errorhandler(413)
 def too_large(error):
+    if request.path.startswith('/api/'):
+        return api_text('Upload too large. Choose an image smaller than 10 MB.', 413)
     if getattr(g, 'user', None) is not None:
         return show_home('Upload too large. Choose an image smaller than 10 MB.', 413)
     return 'Request too large.', 413
@@ -428,21 +603,35 @@ def index():
     if pet is None:
         return show_home('Choose or create a pet before submitting an image.', 400)
     session['pet_id'] = pet['id']
-    upload = request.files.get('image')
+    try:
+        analyze_upload(g.user['id'], pet, request.files.get('image'))
+    except AnalysisError as error:
+        return show_home(str(error), error.status)
+    return redirect(url_for('index', pet_id=pet['id']))
+
+
+class AnalysisError(Exception):
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status = status
+
+
+def analyze_upload(user_id, pet, upload):
+    """The shared browser/device path for validation, context, API, and storage."""
     if not upload or not upload.filename:
-        return show_home('Please choose an image.', 400)
+        raise AnalysisError('Please choose an image.', 400)
     try:
         image_url = prepare_image(upload.read())
     except ValueError as exc:
-        return show_home(str(exc), 400)
+        raise AnalysisError(str(exc), 400) from None
     key = os.getenv('OPENAI_API_KEY', '').strip()
     if not key:
         message = 'Image analysis is unavailable. Please contact the app owner.' if app.config['PRODUCTION'] else 'Add OPENAI_API_KEY to the .env file and restart the server.'
-        return show_home(message, 503)
-    limit_request('image-user', g.user['id'], app.config['IMAGE_DAILY_LIMIT'], 86400)
+        raise AnalysisError(message, 503)
+    limit_request('image-user', user_id, app.config['IMAGE_DAILY_LIMIT'], 86400)
     limit_request('image-global', 'all', app.config['IMAGE_GLOBAL_DAILY_LIMIT'], 86400)
     db = get_db()
-    prior_results = recent_json_context(db, g.user['id'], pet['id'])
+    prior_results = recent_json_context(db, user_id, pet['id'])
     try:
         with OpenAI(api_key=key, timeout=90.0, max_retries=0) as client:
             result = client.responses.create(
@@ -461,10 +650,10 @@ def index():
         if result.status == 'incomplete':
             answer += '\n\n[The response was cut short. It may be incomplete.]'
         with db:
-            db.execute('INSERT INTO responses (user_id, pet_id, answer, json_data, encrypted) VALUES (?, ?, ?, ?, ?)',
-                       (g.user['id'], pet['id'], protect_text(answer), protect_text(extract_json(answer)),
-                        int(app.config['DATA_CIPHER'] is not None)))
-        return redirect(url_for('index', pet_id=pet['id']))
+            response_id = db.execute('INSERT INTO responses (user_id, pet_id, answer, json_data, encrypted) VALUES (?, ?, ?, ?, ?)',
+                       (user_id, pet['id'], protect_text(answer), protect_text(extract_json(answer)),
+                        int(app.config['DATA_CIPHER'] is not None))).lastrowid
+        return answer, response_id
     except AuthenticationError:
         error = 'The API key was rejected. Check OPENAI_API_KEY and restart.'
     except RateLimitError:
@@ -473,7 +662,9 @@ def index():
         error = 'Could not reach OpenAI, or the request timed out. Please try again.'
     except APIStatusError:
         error = 'OpenAI could not process this request. Check model access and try another image.'
-    return show_home(error, 502)
+    except sqlite3.IntegrityError:
+        raise AnalysisError('This pet was removed while analysis was running.', 409) from None
+    raise AnalysisError(error, 502)
 
 
 if __name__ == '__main__':

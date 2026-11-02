@@ -66,6 +66,13 @@ class HostingTests(unittest.TestCase):
                     self.assertIn('SameSite=Lax', cookie)
                     self.assertIn('max-age=31536000', response.headers['Strict-Transport-Security'])
                     self.assertIn(b'/static/auth.css', response.read())
+                request = urllib.request.Request(f'http://127.0.0.1:{port}/api/pets',
+                    headers={'Host': hostname, 'X-Forwarded-Proto': 'https'})
+                with self.assertRaises(urllib.error.HTTPError) as unauthorized:
+                    urllib.request.urlopen(request, timeout=5)
+                self.assertEqual(unauthorized.exception.code, 401)
+                self.assertEqual(unauthorized.exception.headers.get_content_type(), 'text/plain')
+                unauthorized.exception.close()
                 class NoRedirect(urllib.request.HTTPRedirectHandler):
                     def redirect_request(self, *args):
                         return None
