@@ -46,7 +46,7 @@ class ApiTests(unittest.TestCase):
 
     @patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'})
     @patch('app.OpenAI')
-    def test_api_returns_plain_string_and_uses_private_history(self, mock_openai):
+    def test_api_returns_only_percentage_and_saves_full_private_history(self, mock_openai):
         credential = self.device()
         other = self.add_pet('Other')
         with server.app.app_context():
@@ -57,19 +57,67 @@ class ApiTests(unittest.TestCase):
                 db.execute('INSERT INTO responses (user_id, pet_id, answer, json_data) VALUES (1, ?, ?, ?)',
                            (other, 'Other pet', '{"result":"other"}'))
         create = mock_openai.return_value.__enter__.return_value.responses.create
-        create.return_value = SimpleNamespace(output_text='Analysis string\n{"result":"current"}', status='completed')
+        full_result = {'analysis': 'Analysis string with explanation {"example":"inside prose"}', 'healthy_confidence_percent': 87.5,
+                       'diseases': [{'disease': 'Possible dermatitis', 'confidence_percent': 20}]}
+        create.return_value = SimpleNamespace(output_text=json.dumps(full_result), status='completed')
         response = self.api_upload(credential)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, 'text/plain')
-        self.assertEqual(response.text, 'Analysis string\n{"result":"current"}')
+        self.assertEqual(response.text, '87.5%')
+        self.assertEqual(response.headers['X-Analysis-Format'], 'healthy-confidence-percent-v1')
+        self.assertNotIn('Analysis', response.text)
         self.assertIn('X-Response-ID', response.headers)
         context = json.loads(create.call_args.kwargs['input'][0]['content'][1]['text'])
         self.assertEqual(context['previous_results'][0]['result'], {'result': 'prior'})
         self.assertNotIn('Other pet', str(context))
+        self.assertTrue(create.call_args.kwargs['text']['format']['strict'])
+        self.assertEqual(create.call_args.kwargs['text']['format']['schema']['properties']['healthy_confidence_percent']['maximum'], 100)
         page = self.client.get(f'/?pet_id={self.pet_id}')
         self.assertIn(b'Analysis string', page.data)
+        with server.app.app_context():
+            row = server.get_db().execute('SELECT json_data, encrypted FROM responses ORDER BY id DESC LIMIT 1').fetchone()
+            self.assertEqual(json.loads(server.reveal_text(row['json_data'], row['encrypted'])), full_result)
+
+    @patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'})
+    @patch('app.OpenAI')
+    def test_unavailable_invalid_and_incomplete_confidence_never_become_percentages(self, mock_openai):
+        credential = self.device()
+        create = mock_openai.return_value.__enter__.return_value.responses.create
+        valid = {'analysis': 'Image assessment', 'healthy_confidence_percent': 87, 'diseases': []}
+        cases = [
+            (json.dumps({**valid, 'healthy_confidence_percent': value}), 'completed')
+            for value in (None, True, '87%', -1, 101, float('nan'), float('inf'))
+        ] + [
+            ('I cannot assess this image.', 'completed'),
+            ('{"diseases":{"rash":20}}', 'completed'),
+            (json.dumps({**valid, 'diseases': [{'disease': 'Rash', 'confidence_percent': True}]}), 'completed'),
+            (json.dumps(valid), 'incomplete'),
+        ]
+        for answer, status in cases:
+            with self.subTest(answer=answer, status=status):
+                create.return_value = SimpleNamespace(output_text=answer, status=status)
+                response = self.api_upload(credential)
+                self.assertEqual(response.status_code, 422)
+                self.assertIn('saved', response.text)
+                self.assertIn('X-Response-ID', response.headers)
+        with server.app.app_context():
+            self.assertEqual(server.get_db().execute('SELECT count(*) FROM responses').fetchone()[0], len(cases))
+
+    @patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'})
+    @patch('app.OpenAI')
+    def test_percentage_boundaries_and_small_scores(self, mock_openai):
+        credential = self.device()
+        create = mock_openai.return_value.__enter__.return_value.responses.create
+        for score, expected in ((0, '0%'), (100, '100%'), (95.25, '95.25%'), (0.0000001, '0.0000001%')):
+            with self.subTest(score=score):
+                create.return_value = SimpleNamespace(output_text=json.dumps({
+                    'analysis': 'Full explanation', 'healthy_confidence_percent': score, 'diseases': []}), status='completed')
+                self.assertEqual(self.api_upload(credential).text, expected)
 
     def test_cookie_is_not_api_authentication(self):
+        upload_response = self.client.post('/api/images')
+        self.assertEqual(upload_response.status_code, 401)
+        self.assertEqual(upload_response.headers['X-Analysis-Format'], 'healthy-confidence-percent-v1')
         response = self.client.get('/api/pets')
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.mimetype, 'text/plain')
@@ -168,7 +216,8 @@ class ApiTests(unittest.TestCase):
     def test_actual_pi_client_multipart(self, mock_openai):
         credential = self.device()
         create = mock_openai.return_value.__enter__.return_value.responses.create
-        create.return_value = SimpleNamespace(output_text='Pi received this string.', status='completed')
+        create.return_value = SimpleNamespace(output_text=json.dumps({
+            'analysis': 'Full explanation retained on website', 'healthy_confidence_percent': 92, 'diseases': []}), status='completed')
         image_path = Path(self.directory.name) / 'photo.png'
         Image.new('RGB', (10, 10)).save(image_path)
         httpd = make_server('127.0.0.1', 0, server.app)
@@ -176,7 +225,7 @@ class ApiTests(unittest.TestCase):
         thread.start()
         try:
             answer = pi_upload.upload_image(f'http://127.0.0.1:{httpd.server_port}', credential, image_path)
-            self.assertEqual(answer, 'Pi received this string.')
+            self.assertEqual(answer, '92%')
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -184,6 +233,16 @@ class ApiTests(unittest.TestCase):
 
 
 class PiClientTests(unittest.TestCase):
+    def test_client_rejects_old_messages_and_invalid_percentages(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            image = Path(directory) / 'photo.jpg'
+            image.write_bytes(b'mocked image')
+            for reply in ('Full analysis 90%', '101%', '-5%', 'NaN%', '0.87', '{"healthy":90}'):
+                with self.subTest(reply=reply), patch.object(pi_upload, 'api_request', return_value=reply):
+                    with self.assertRaises(pi_upload.UploadError):
+                        pi_upload.upload_image('https://pets.example', 'test-only', image)
+
     def test_remote_http_and_credentials_in_url_rejected(self):
         for url in ('http://pets.example', 'https://user:pass@pets.example', 'https://pets.example/?key=secret'):
             with self.assertRaises(pi_upload.UploadError):
@@ -214,14 +273,14 @@ class PiClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
             image = Path(directory) / 'image.jpg'
             image.write_bytes(b'fake image bytes for mocked server')
-            replies = [json.dumps({'access_token': credential}), 'Simple analysis string', 'Credential revoked.']
+            replies = [json.dumps({'access_token': credential}), '85.5%', 'Credential revoked.']
             output = io.StringIO()
             with patch.object(pi_upload, 'api_request', side_effect=replies) as request_call, \
                  patch.object(pi_upload.getpass, 'getpass', return_value='test-password'), \
                  patch('sys.stdout', output):
                 result = pi_upload.main([str(image), '--server', 'https://pets.example', '--username', 'alice', '--pet-id', '1'])
             self.assertEqual(result, 0)
-            self.assertEqual(output.getvalue(), 'Simple analysis string\n')
+            self.assertEqual(output.getvalue(), '85.5%\n')
             self.assertEqual(request_call.call_args_list[-1].args[1], '/api/logout')
             self.assertNotIn(credential, output.getvalue())
 
@@ -237,7 +296,7 @@ class PiClientTests(unittest.TestCase):
                 photo.write_bytes(b'fake photo for mocked server')
                 captured.append(photo)
             with patch.object(pi_upload.subprocess, 'run', side_effect=capture), \
-                 patch.object(pi_upload, 'api_request', return_value='Camera result'), patch('sys.stdout', io.StringIO()):
+                 patch.object(pi_upload, 'api_request', return_value='90%'), patch('sys.stdout', io.StringIO()):
                 result = pi_upload.main(['--capture', '--server', 'https://pets.example', '--token-file', str(token_file)])
             self.assertEqual(result, 0)
             self.assertFalse(captured[0].exists())

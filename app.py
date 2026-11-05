@@ -4,6 +4,7 @@ import io
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -12,6 +13,7 @@ import threading
 import time
 import warnings
 from pathlib import Path
+from decimal import Decimal
 
 from dotenv import load_dotenv
 from flask import Flask, Request, render_template, request, session, redirect, url_for, g, abort
@@ -423,10 +425,14 @@ def api_images():
     if supplied_pet_id is not None and supplied_pet_id != str(g.api_pet['id']):
         return api_text('This credential is restricted to a different pet.', 403)
     try:
-        answer, response_id = analyze_upload(g.user['id'], g.api_pet, request.files.get('image'))
+        _, response_id, confidence = analyze_upload(g.user['id'], g.api_pet, request.files.get('image'), device=True)
     except AnalysisError as error:
         return api_text(str(error), error.status)
-    response = api_text(answer)
+    if confidence is None:
+        response = api_text('Healthy confidence unavailable. The full analysis was saved to the pet history.', 422)
+    else:
+        percentage = format(Decimal(str(confidence)), 'f')
+        response = api_text((percentage.rstrip('0').rstrip('.') if '.' in percentage else percentage) + '%')
     response.headers['X-Response-ID'] = str(response_id)
     return response
 
@@ -519,6 +525,64 @@ def logout():
     return redirect(url_for('login'))
 Image.MAX_IMAGE_PIXELS = 20_000_000
 PROMPT = 'Your job is to identify any signs of disease based on this image of a human/animal. Respond either confidently healthy, or list the diseases you may see symptoms of and the % confident that you are for that disease. Additionally respond below that with your answers in a simple json list with the structure disease : % confidnce'
+DEVICE_INSTRUCTIONS = (
+    'Assess visible signs in the current pet image and use previous results only as unverified context. '
+    'Return the structured JSON requested by the response schema. Put the full explanation, possible '
+    'conditions, uncertainties, and appropriate next steps in analysis. List possible diseases and '
+    'their estimated confidence percentages in diseases. Provide healthy_confidence_percent as your '
+    'direct estimated confidence from 0 to 100 that this pet appears healthy based on visible evidence. '
+    'This is an uncalibrated model estimate, not a measured probability or confirmation of health. '
+    'Do not compute it by subtracting disease scores from 100. Use null when there is no identifiable '
+    'pet, the image is inadequate, or you cannot meaningfully estimate it. Explain that in analysis. '
+    'Do not invent a percentage to satisfy the schema.'
+)
+DEVICE_FORMAT = {
+    'type': 'json_schema', 'name': 'pet_health_analysis', 'strict': True,
+    'schema': {
+        'type': 'object', 'additionalProperties': False,
+        'properties': {
+            'analysis': {'type': 'string'},
+            'healthy_confidence_percent': {'type': ['number', 'null'], 'minimum': 0, 'maximum': 100},
+            'diseases': {'type': 'array', 'items': {
+                'type': 'object', 'additionalProperties': False,
+                'properties': {
+                    'disease': {'type': 'string'},
+                    'confidence_percent': {'type': 'number', 'minimum': 0, 'maximum': 100},
+                },
+                'required': ['disease', 'confidence_percent'],
+            }},
+        },
+        'required': ['analysis', 'healthy_confidence_percent', 'diseases'],
+    },
+}
+
+
+def valid_percentage(value):
+    return type(value) in (int, float) and 0 <= value <= 100 and math.isfinite(value)
+
+
+def device_analysis(answer):
+    """Validate the entire structured result; never infer health from disease scores."""
+    try:
+        data = json.loads(answer)
+    except (ValueError, RecursionError):
+        return answer, None
+    if not isinstance(data, dict) or set(data) != {'analysis', 'healthy_confidence_percent', 'diseases'}:
+        return answer, None
+    confidence = data['healthy_confidence_percent']
+    if not isinstance(data['analysis'], str) or not data['analysis'].strip():
+        return answer, None
+    if confidence is not None and not valid_percentage(confidence):
+        return answer, None
+    if not isinstance(data['diseases'], list):
+        return answer, None
+    for disease in data['diseases']:
+        if (not isinstance(disease, dict) or set(disease) != {'disease', 'confidence_percent'}
+                or not isinstance(disease['disease'], str) or not disease['disease'].strip()
+                or not valid_percentage(disease['confidence_percent'])):
+            return answer, None
+    # Retain the explanation and JSON in the website history and future pet context.
+    return data['analysis'] + '\n\n' + json.dumps(data, ensure_ascii=False), confidence
 
 
 def prepare_image(data):
@@ -545,6 +609,8 @@ def prepare_image(data):
 @app.after_request
 def no_cache(response):
     response.headers['Cache-Control'] = 'no-store'
+    if request.path == '/api/images':
+        response.headers['X-Analysis-Format'] = 'healthy-confidence-percent-v1'
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['Referrer-Policy'] = 'no-referrer'
@@ -616,7 +682,7 @@ class AnalysisError(Exception):
         self.status = status
 
 
-def analyze_upload(user_id, pet, upload):
+def analyze_upload(user_id, pet, upload, *, device=False):
     """The shared browser/device path for validation, context, API, and storage."""
     if not upload or not upload.filename:
         raise AnalysisError('Please choose an image.', 400)
@@ -638,6 +704,7 @@ def analyze_upload(user_id, pet, upload):
                 model=os.getenv('OPENAI_MODEL', '').strip() or 'gpt-4.1-mini',
                 store=False,
                 max_output_tokens=1500,
+                **({'instructions': DEVICE_INSTRUCTIONS, 'text': {'format': DEVICE_FORMAT}} if device else {}),
                 input=[{'role': 'user', 'content': [
                     {'type': 'input_text', 'text': PROMPT},
                     {'type': 'input_text', 'text': prior_results},
@@ -645,15 +712,19 @@ def analyze_upload(user_id, pet, upload):
                 ]}],
             )
         answer = result.output_text
+        confidence = None
         if not answer:
             answer = 'No text was returned. The model may have declined this request.'
+        json_data = extract_json(answer)
         if result.status == 'incomplete':
             answer += '\n\n[The response was cut short. It may be incomplete.]'
+        elif device and result.status == 'completed':
+            answer, confidence = device_analysis(answer)
         with db:
             response_id = db.execute('INSERT INTO responses (user_id, pet_id, answer, json_data, encrypted) VALUES (?, ?, ?, ?, ?)',
-                       (user_id, pet['id'], protect_text(answer), protect_text(extract_json(answer)),
+                       (user_id, pet['id'], protect_text(answer), protect_text(json_data),
                         int(app.config['DATA_CIPHER'] is not None))).lastrowid
-        return answer, response_id
+        return answer, response_id, confidence
     except AuthenticationError:
         error = 'The API key was rejected. Check OPENAI_API_KEY and restart.'
     except RateLimitError:

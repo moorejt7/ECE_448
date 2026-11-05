@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload one pet image and print the server's plain-text analysis. Python 3.10+."""
+"""Upload one pet image and print healthy confidence, e.g. 87.5%. Python 3.10+."""
 import argparse
 import getpass
 import json
@@ -100,8 +100,11 @@ def upload_image(server, token, image_path, pet_id=None):
         image,
         f'\r\n--{boundary}--\r\n'.encode(),
     ])
-    return api_request(server, '/api/images', token=token, body=b''.join(chunks),
-                       content_type=f'multipart/form-data; boundary={boundary}')
+    answer = api_request(server, '/api/images', token=token, body=b''.join(chunks),
+                         content_type=f'multipart/form-data; boundary={boundary}').strip()
+    if not re.fullmatch(r'(?:100(?:\.0+)?|(?:[0-9]|[1-9][0-9])(?:\.[0-9]+)?)%', answer):
+        raise UploadError('The server did not return a healthy-confidence percentage. Check that the updated server is deployed. No automatic retry was made.')
+    return answer
 
 
 def main(argv=None):

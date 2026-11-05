@@ -2,7 +2,7 @@
 
 A local Python/Flask HTML server that sends one uploaded image and your exact requested prompt to the OpenAI Responses API, then displays the returned text on the page.
 
-Raspberry Pi uploads are supported through a pet-scoped HTTPS API. See [raspberry_pi/README.md](raspberry_pi/README.md) for the ready-to-run Python client, camera capture, credential setup, and API contract. The website can issue and revoke device credentials under each pet. Browser and device uploads share image validation, model context, storage, and quotas.
+Raspberry Pi uploads are supported through a pet-scoped HTTPS API. See [raspberry_pi/README.md](raspberry_pi/README.md) for the ready-to-run Python client, camera capture, credential setup, and API contract. The website can issue and revoke device credentials under each pet. Browser and device uploads share image validation, model context, storage, and quotas. Successful device uploads return only a healthy-confidence percentage such as `87.5%`; the full structured assessment remains in the pet history. Devices receive HTTP 422 when a meaningful score is unavailable. The score is a model estimate, not a validated health probability.
 
 For HTTPS hosting, persistent storage, deployment variables, and security maintenance, see [RENDER.md](RENDER.md). The `render.yaml` Blueprint configures the paid service and persistent disk. Production signup requires an invitation code to protect paid API usage. [Railway instructions](RAILWAY.md) remain available as an alternative.
 
@@ -42,7 +42,7 @@ Restart after editing `.env`. An existing environment variable takes precedence 
 
 - Accepts JPEG, PNG, WebP, and non-animated GIF, up to 10 MB / 20 million pixels.
 - Validates image contents, applies camera orientation, and converts to JPEG without metadata before sending.
-- Sends the exact prompt in `app.py` without rewriting it. The model may decline, qualify its answer, or use a different response format.
+- Browser uploads send the prompt in `app.py`. Device uploads additionally request a strict JSON assessment containing the full explanation, disease scores, and a direct healthy-confidence estimate (or null when unavailable). The model may decline or qualify its answer.
 - Shows returned text with HTML escaping. Responses are saved per pet in SQLite; uploaded images are not saved. Requests use `store=False`; OpenAI's own data policies still apply.
 - Handles missing/invalid keys, invalid uploads, timeouts, quota issues, and API errors.
 - `start.bat` binds only to localhost with debug disabled. Hosted deployments use Gunicorn, HTTPS, persistent storage, invitation-only signup, and secure cookies.
